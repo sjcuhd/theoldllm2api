@@ -1,11 +1,12 @@
 /**
- * Universal LLM Proxy - Deno Deploy
- * 支持 Chat (OpenAI/Anthropic/DeepSeek) 和 Image (SD3.5/Flux)
- */
+* Universal LLM Proxy - Deno Deploy
+* 支持 Chat (OpenAI/Anthropic/DeepSeek) 和 Image (SD3.5/Flux)
+* Updated for new upstream endpoints (/sv5/)
+*/
 
 // === 配置区域 ===
 const UPSTREAM_ORIGIN = "https://theoldllm.vercel.app";
-const DEFAULT_CHAT_MODEL = "";
+const DEFAULT_CHAT_MODEL = "ent-gpt-4o";
 
 // 默认 Token (依然保留 chat 的 token 作为回退，如果请求 Image 失败，请在客户端 Header 传入 mnn-key)
 const FALLBACK_TOKEN = "Bearer ";
@@ -160,7 +161,6 @@ function getCamouflagedHeaders(token: string) {
 }
 
 // === 辅助函数 ===
-// 已移除系统Prompt强制覆盖，恢复简单拼接
 function convertMessagesToPrompt(messages: any[]): string {
   if (!Array.isArray(messages)) return "";
   return messages.map(m => {
@@ -177,7 +177,6 @@ function getBackendModelName(requestedId: string): string {
 }
 
 // === 主服务逻辑 ===
-
 Deno.serve(async (req) => {
   const url = new URL(req.url);
   const method = req.method;
@@ -198,7 +197,7 @@ Deno.serve(async (req) => {
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
     authHeader = FALLBACK_TOKEN;
   }
-  
+
   // 1. GET /v1/models (包含 Chat 和 Image)
   if (url.pathname === "/v1/models") {
     return new Response(JSON.stringify({
@@ -222,25 +221,25 @@ Deno.serve(async (req) => {
       const userModel = body.model || DEFAULT_CHAT_MODEL;
       const isStream = body.stream || false;
       const headers = getCamouflagedHeaders(authHeader);
-
       const actualModelName = getBackendModelName(userModel);
-      
-      // Step 1: Create Session
-      const sessionResp = await fetch(`${UPSTREAM_ORIGIN}/entp/chat/create-chat-session`, {
+
+      // Step 1: Create Session (UPDATED: /sv5/ path and persona_id 837)
+      const sessionResp = await fetch(`${UPSTREAM_ORIGIN}/sv5/chat/create-chat-session`, {
         method: "POST",
         headers: headers,
         body: JSON.stringify({
-          persona_id: 154,
+          persona_id: 837, // Updated from 154 based on new curl
           description: `Streaming chat session using ${actualModelName}`
         })
       });
+
       if (!sessionResp.ok) throw new Error(`Create Session Failed: ${sessionResp.status}`);
       const sessionData = await sessionResp.json();
       const sessionId = sessionData.chat_session_id;
 
-      // Step 2: Send Message
+      // Step 2: Send Message (UPDATED: /sv5/ path)
       const prompt = convertMessagesToPrompt(body.messages);
-      const msgResp = await fetch(`${UPSTREAM_ORIGIN}/entp/chat/send-message`, {
+      const msgResp = await fetch(`${UPSTREAM_ORIGIN}/sv5/chat/send-message`, {
         method: "POST",
         headers: headers,
         body: JSON.stringify({
@@ -272,11 +271,10 @@ Deno.serve(async (req) => {
             while (true) {
               const { done, value } = await reader.read();
               if (done) break;
-              
               const chunk = decoder.decode(value, { stream: true });
               buffer += chunk;
               const lines = buffer.split("\n");
-              buffer = lines.pop() || ""; 
+              buffer = lines.pop() || "";
 
               for (const line of lines) {
                 if (!line.trim()) continue;
@@ -339,23 +337,23 @@ Deno.serve(async (req) => {
       }
 
     } catch (e: any) {
-      return new Response(JSON.stringify({ error: e.message }), { 
-        status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } 
+      return new Response(JSON.stringify({ error: e.message }), {
+        status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });
     }
   }
 
-  // 3. POST /v1/images/generations (绘图 - 新增)
+  // 3. POST /v1/images/generations (绘图)
   if (url.pathname === "/v1/images/generations" && method === "POST") {
     try {
       const body = await req.json();
       const headers = getCamouflagedHeaders(authHeader);
-
+      
       // 参数校验与默认值
       const model = body.model || "sd-3.5-large";
       const prompt = body.prompt;
       let size = body.size || "1024x1024";
-      
+
       if (!prompt) throw new Error("Missing prompt");
       if (!imgSizes.includes(size)) size = "1024x1024"; // Fallback to safe size
 
@@ -386,8 +384,8 @@ Deno.serve(async (req) => {
       });
 
     } catch (e: any) {
-      return new Response(JSON.stringify({ error: e.message }), { 
-        status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } 
+      return new Response(JSON.stringify({ error: e.message }), {
+        status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });
     }
   }
