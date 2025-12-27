@@ -1,19 +1,18 @@
 /**
  * Universal LLM Proxy - Deno Deploy
- * 支持 TheOldLLM 的所有模型 (OpenAI, Anthropic, DeepSeek, Gemini, xAI, etc.)
+ * 支持 Chat (OpenAI/Anthropic/DeepSeek) 和 Image (SD3.5/Flux)
  */
 
 // === 配置区域 ===
 const UPSTREAM_ORIGIN = "https://theoldllm.vercel.app";
-const DEFAULT_MODEL = "ent-gpt-4o"; // 默认模型
+const DEFAULT_CHAT_MODEL = "ent-gpt-4o";
 
-// 硬编码 Token (来自你的抓包)
-// 建议在客户端请求 Header 中传入 Authorization: Bearer ... 以覆盖此值
-const FALLBACK_TOKEN = "Bearer ";
+// 默认 Token (依然保留 chat 的 token 作为回退，如果请求 Image 失败，请在客户端 Header 传入 mnn-key)
+const FALLBACK_TOKEN = "Bearer on_tenant_65566e34-de7f-490a-b88f-32ac8203b659.FlFtgizBOIHSKUrSYbSiT23u7VK3-AHqf64TtjN5v0qP-8AD8QJQ6RLxl0zG9Cgjj5R5ICdgNYFBz9JSv3OJcN3LiKtA6oJTj9CF_1nKjkZQ-InxkNfhEzktF52PXVvFxy7H1IR5JH9PnmMo467YfkAzf8z8vbRmW9WUQcqhBEMuxogPfqAIL1b60F8wGup7WChnADayGVAXyg0ihs4K-fXRyiR7OvXRii05DGX9XT7KtJvb24-XY_VEmWi8OO_o";
 
-// === 模型定义 (来自提供的 JS 源码) ===
+// === 模型定义 ===
 
-// High-tier Services (OpenAI, Anthropic)
+// 1. Chat Models (High-tier)
 const hS = [
   {id:"ent-gpt-5.2",name:"GPT-5.2",llmVersion:"gpt-5.2"},
   {id:"ent-gpt-5.1",name:"GPT-5.1",llmVersion:"gpt-5.1"},
@@ -69,7 +68,7 @@ const hS = [
   {id:"ent-claude-3-haiku",name:"Claude 3 Haiku",llmVersion:"claude-3-haiku-20240307"}
 ];
 
-// Diverse Services (DeepSeek, Gemini, Meta, etc.)
+// 2. Chat Models (Diverse)
 const dS = [
   {id:"deepseek-prover-v2",name:"DeepSeek Prover V2"},
   {id:"deepseek-r1",name:"DeepSeek R1"},
@@ -120,11 +119,21 @@ const dS = [
   {id:"glm-4.7",name:"GLM-4.7"}
 ];
 
-// 合并所有模型供查询
-const ALL_MODELS = [...hS, ...dS];
+// 3. Image Models
+const imgModels = [
+  {id:"sd-3.5-large",name:"SD 3.5 Large",provider:"Stability"},
+  {id:"sd-3.5-medium",name:"SD 3.5 Medium",provider:"Stability"},
+  {id:"flux-dev",name:"Flux Dev",provider:"BFL"},
+  {id:"flux-schnell",name:"Flux Schnell",provider:"BFL"}
+];
 
-// === 伪装与辅助函数 ===
+// Image Sizes (Supported by upstream)
+const imgSizes = ["1024x1024", "1024x1792", "1792x1024"];
 
+// 合并所有模型
+const ALL_MODELS = [...hS, ...dS, ...imgModels];
+
+// === 伪装头 ===
 function getCamouflagedHeaders(token: string) {
   return {
     "Host": "theoldllm.vercel.app",
@@ -150,28 +159,31 @@ function getCamouflagedHeaders(token: string) {
   };
 }
 
+// === 辅助函数 ===
+// 已移除系统Prompt强制覆盖，恢复简单拼接
 function convertMessagesToPrompt(messages: any[]): string {
   if (!Array.isArray(messages)) return "";
-  return messages.map(m => `${m.role}: ${m.content}`).join("\n\n");
+  return messages.map(m => {
+    let role = m.role.charAt(0).toUpperCase() + m.role.slice(1);
+    return `${role}: ${m.content}`;
+  }).join("\n\n");
 }
 
-// 查找模型对应的后端描述名
-// 逻辑：如果模型在 hS 列表中，使用 llmVersion；否则使用 id
 function getBackendModelName(requestedId: string): string {
   const modelObj = ALL_MODELS.find(m => m.id === requestedId);
-  if (!modelObj) return requestedId; // Fallback
+  if (!modelObj) return requestedId;
   // @ts-ignore
-  if (modelObj.llmVersion) return modelObj.llmVersion;
-  return modelObj.id;
+  return modelObj.llmVersion || modelObj.id;
 }
 
 // === 主服务逻辑 ===
 
 Deno.serve(async (req) => {
   const url = new URL(req.url);
+  const method = req.method;
 
   // CORS
-  if (req.method === "OPTIONS") {
+  if (method === "OPTIONS") {
     return new Response(null, {
       headers: {
         "Access-Control-Allow-Origin": "*",
@@ -181,7 +193,13 @@ Deno.serve(async (req) => {
     });
   }
 
-  // 1. GET /v1/models
+  // 获取鉴权 Token
+  let authHeader = req.headers.get("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    authHeader = FALLBACK_TOKEN;
+  }
+  
+  // 1. GET /v1/models (包含 Chat 和 Image)
   if (url.pathname === "/v1/models") {
     return new Response(JSON.stringify({
       object: "list",
@@ -190,59 +208,38 @@ Deno.serve(async (req) => {
         object: "model",
         created: Math.floor(Date.now() / 1000),
         owned_by: "openai-proxy",
-        name: m.name // 额外字段，方便人类阅读
+        name: m.name
       }))
     }), {
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
     });
   }
 
-  // 2. POST /v1/chat/completions
-  if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
+  // 2. POST /v1/chat/completions (聊天)
+  if (url.pathname === "/v1/chat/completions" && method === "POST") {
     try {
       const body = await req.json();
-      const userModel = body.model || DEFAULT_MODEL;
+      const userModel = body.model || DEFAULT_CHAT_MODEL;
       const isStream = body.stream || false;
-
-      // 鉴权
-      let authHeader = req.headers.get("Authorization");
-      if (!authHeader || !authHeader.startsWith("Bearer ")) {
-        authHeader = FALLBACK_TOKEN;
-      }
-
-      // 获取伪装 Headers
       const headers = getCamouflagedHeaders(authHeader);
 
-      // --- Step 1: 映射模型名 ---
-      // 客户端传 'ent-gpt-5.2' -> 我们转成 'gpt-5.2' 传给后端
-      // 客户端传 'deepseek-r1' -> 我们传 'deepseek-r1'
       const actualModelName = getBackendModelName(userModel);
       
-      // --- Step 2: 创建 Session ---
-      // description 字段是路由的关键
-      const sessionPayload = {
-        persona_id: 154,
-        description: `Streaming chat session using ${actualModelName}`
-      };
-
-      const createResp = await fetch(`${UPSTREAM_ORIGIN}/entp/chat/create-chat-session`, {
+      // Step 1: Create Session
+      const sessionResp = await fetch(`${UPSTREAM_ORIGIN}/entp/chat/create-chat-session`, {
         method: "POST",
         headers: headers,
-        body: JSON.stringify(sessionPayload)
+        body: JSON.stringify({
+          persona_id: 154,
+          description: `Streaming chat session using ${actualModelName}`
+        })
       });
-
-      if (!createResp.ok) {
-        const err = await createResp.text();
-        throw new Error(`Create Session Error (${createResp.status}): ${err}`);
-      }
-      
-      const sessionData = await createResp.json();
+      if (!sessionResp.ok) throw new Error(`Create Session Failed: ${sessionResp.status}`);
+      const sessionData = await sessionResp.json();
       const sessionId = sessionData.chat_session_id;
-      if (!sessionId) throw new Error("No chat_session_id returned");
 
-      // --- Step 3: 发送消息 ---
+      // Step 2: Send Message
       const prompt = convertMessagesToPrompt(body.messages);
-      
       const msgResp = await fetch(`${UPSTREAM_ORIGIN}/entp/chat/send-message`, {
         method: "POST",
         headers: headers,
@@ -256,13 +253,11 @@ Deno.serve(async (req) => {
         })
       });
 
-      if (!msgResp.ok) {
-        throw new Error(`Send Message Error (${msgResp.status})`);
-      }
+      if (!msgResp.ok) throw new Error(`Send Message Failed: ${msgResp.status}`);
 
-      // --- Step 4: 流式转换 ---
+      // Step 3: Stream Response
       const stream = msgResp.body;
-      if (!stream) throw new Error("No upstream stream");
+      if (!stream) throw new Error("No upstream body");
 
       const readable = new ReadableStream({
         async start(controller) {
@@ -271,7 +266,6 @@ Deno.serve(async (req) => {
           const encoder = new TextEncoder();
           const chunkId = `chatcmpl-${crypto.randomUUID()}`;
           const created = Math.floor(Date.now() / 1000);
-          
           let buffer = "";
 
           try {
@@ -281,7 +275,6 @@ Deno.serve(async (req) => {
               
               const chunk = decoder.decode(value, { stream: true });
               buffer += chunk;
-              
               const lines = buffer.split("\n");
               buffer = lines.pop() || ""; 
 
@@ -289,22 +282,19 @@ Deno.serve(async (req) => {
                 if (!line.trim()) continue;
                 try {
                   const json = JSON.parse(line);
-                  // 解析逻辑：{"ind":1, "obj":{"type":"message_delta","content":"..."}}
                   if (json?.obj?.type === "message_delta" && json.obj.content) {
-                    const content = json.obj.content;
-                    
                     if (isStream) {
-                      const chunkData = {
+                      const data = JSON.stringify({
                         id: chunkId,
                         object: "chat.completion.chunk",
                         created: created,
                         model: userModel,
-                        choices: [{ index: 0, delta: { content }, finish_reason: null }]
-                      };
-                      controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunkData)}\n\n`));
+                        choices: [{ index: 0, delta: { content: json.obj.content }, finish_reason: null }]
+                      });
+                      controller.enqueue(encoder.encode(`data: ${data}\n\n`));
                     }
                   }
-                } catch (e) { /* ignore json parse error */ }
+                } catch (e) {}
               }
             }
             if (isStream) controller.enqueue(encoder.encode("data: [DONE]\n\n"));
@@ -318,15 +308,10 @@ Deno.serve(async (req) => {
 
       if (isStream) {
         return new Response(readable, {
-          headers: {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Access-Control-Allow-Origin": "*"
-          }
+          headers: { "Content-Type": "text/event-stream", "Access-Control-Allow-Origin": "*" }
         });
       } else {
-        // 非流式兼容
+        // Simple Non-Stream fallback
         const reader = readable.getReader();
         const decoder = new TextDecoder();
         let fullText = "";
@@ -355,8 +340,54 @@ Deno.serve(async (req) => {
 
     } catch (e: any) {
       return new Response(JSON.stringify({ error: e.message }), { 
-        status: 500,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } 
+        status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } 
+      });
+    }
+  }
+
+  // 3. POST /v1/images/generations (绘图 - 新增)
+  if (url.pathname === "/v1/images/generations" && method === "POST") {
+    try {
+      const body = await req.json();
+      const headers = getCamouflagedHeaders(authHeader);
+
+      // 参数校验与默认值
+      const model = body.model || "sd-3.5-large";
+      const prompt = body.prompt;
+      let size = body.size || "1024x1024";
+      
+      if (!prompt) throw new Error("Missing prompt");
+      if (!imgSizes.includes(size)) size = "1024x1024"; // Fallback to safe size
+
+      // 构造上游请求
+      const imgPayload = {
+        model: model,
+        prompt: prompt,
+        size: size,
+        n: 1,
+        response_format: "url" // 上游固定只接受 url
+      };
+
+      const resp = await fetch(`${UPSTREAM_ORIGIN}/api/v1/images/generations`, {
+        method: "POST",
+        headers: headers,
+        body: JSON.stringify(imgPayload)
+      });
+
+      if (!resp.ok) {
+        const errText = await resp.text();
+        throw new Error(`Image Gen Failed (${resp.status}): ${errText}`);
+      }
+
+      // 直接透传上游的 OpenAI 格式响应
+      const data = await resp.json();
+      return new Response(JSON.stringify(data), {
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      });
+
+    } catch (e: any) {
+      return new Response(JSON.stringify({ error: e.message }), { 
+        status: 500, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } 
       });
     }
   }
