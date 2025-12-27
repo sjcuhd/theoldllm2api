@@ -86,6 +86,8 @@ const demoModels = [
   {id:"minimax-01",name:"Minimax 01"},
   {id:"minimax-m1",name:"Minimax M1"},
   {id:"minimax-m2",name:"Minimax M2"},
+  {id:"minimax-m2.1",name:"Minimax M2.1"},
+  {id:"kimi-k2:1t",name:"Kimi K2 1T"},
   {id:"devstral-medium",name:"Devstral Medium"},
   {id:"devstral-2512:free",name:"Devstral 2512"},
   {id:"magistral-medium-2506:thinking",name:"Magistral Medium Thinking"},
